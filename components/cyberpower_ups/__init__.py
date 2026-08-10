@@ -30,7 +30,7 @@ async def to_code(config):
     # USB HID host support
     # Hub support disabled for now — was preventing device detection entirely
     # Low-speed devices (1.5Mbps UPS) may need a hub, but first get basic detection working
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", False)
+    add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
     add_idf_sdkconfig_option("CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK", True)
 
     # PSRAM can cause USB host interrupts to be missed (ESP-IDF #9519)
