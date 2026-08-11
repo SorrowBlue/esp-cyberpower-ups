@@ -242,6 +242,8 @@ class CyberpowerUpsComponent : public Component {
   uint16_t hid_report_desc_len_ = 0;
   HidReportMap report_map_;
   bool device_open_ = false;
+  uint16_t vendor_id_ = 0;
+  uint16_t product_id_ = 0;
 
   // Control transfer buffer
   static constexpr size_t CTRL_BUF_SIZE = 1024;
@@ -453,6 +455,8 @@ class CyberpowerUpsComponent : public Component {
     usb_host_get_device_descriptor(dev_hdl_, &desc);
 
     ESP_LOGI(TAG, "Device: VID=0x%04X PID=0x%04X", desc->idVendor, desc->idProduct);
+    this->vendor_id_ = desc->idVendor;
+    this->product_id_ = desc->idProduct;
     log_ring_append_("USB device opened");
 
     char msg[80];
@@ -1088,6 +1092,89 @@ class CyberpowerUpsComponent : public Component {
     log_ring_append_(msg);
   }
 
+  void poll_custom_ups_data_(UpsData &tmp) {
+    uint8_t buf[16];
+    int32_t val;
+
+    // 1. Utility Voltage (Report 15, INPUT, Byte 1-2)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(15, ReportType::INPUT, buf, 3)) {
+      val = buf[1] | (buf[2] << 8);
+      if (val > 0 && val < 400) {
+        tmp.utility_voltage = (float)val;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 2. Output Voltage (Report 18, FEATURE, Byte 1-2)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(18, ReportType::FEATURE, buf, 3)) {
+      val = buf[1] | (buf[2] << 8);
+      if (val > 0 && val < 400) {
+        tmp.output_voltage = (float)val;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 3. Battery Voltage (Report 11, INPUT, Byte 1-2 * 0.1, or fallback Report 41, FEATURE, Byte 2 * 0.2)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(11, ReportType::INPUT, buf, 3)) {
+      val = buf[1] | (buf[2] << 8);
+      if (val > 0 && val < 600) {
+        tmp.battery_voltage = (float)val * 0.1f;
+      }
+    } else {
+      memset(buf, 0, sizeof(buf));
+      if (read_hid_report_(41, ReportType::FEATURE, buf, 3)) {
+        if (buf[2] > 0) {
+          tmp.battery_voltage = (float)buf[2] * 0.2f;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 4. Battery Capacity & Runtime (Report 8, FEATURE, 6 bytes)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(8, ReportType::FEATURE, buf, 6)) {
+      if (buf[1] <= 100) {
+        tmp.battery_capacity = (float)buf[1];
+      }
+      val = buf[2] | (buf[3] << 8);
+      tmp.remaining_runtime_sec = (float)val;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 5. Apparent Power (Load) & Load Percent (Report 29, INPUT, Byte 1-2)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(24, ReportType::FEATURE, buf, 6)) {
+      tmp.rating_power_va = (float)(buf[3] | (buf[4] << 8));
+      tmp.rating_power_w = tmp.rating_power_va * 0.6f;
+      if (buf[2] == 3) tmp.rating_voltage = 120.0f;
+      else if (buf[2] == 7) tmp.rating_voltage = 230.0f;
+      else tmp.rating_voltage = 100.0f;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(29, ReportType::INPUT, buf, 3)) {
+      val = buf[1] | (buf[2] << 8);
+      float rating_w = (tmp.rating_power_w > 0) ? tmp.rating_power_w : 720.0f;
+      tmp.load_percent = ((float)val / rating_w) * 100.0f;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 6. Binary status (Report 11, INPUT, Byte 1)
+    memset(buf, 0, sizeof(buf));
+    if (read_hid_report_(11, ReportType::INPUT, buf, 3)) {
+      uint8_t stat = buf[1];
+      tmp.ac_present = (stat & 0x01) != 0;
+      tmp.on_battery = (stat & 0x04) != 0;
+      tmp.charging = (stat & 0x02) != 0;
+      tmp.battery_low_flag = (stat & 0x08) != 0;
+      tmp.overload = (stat & 0x20) != 0;
+    }
+  }
+
   // ── Poll all UPS data ─────────────────────────────────────
   // USB control transfers take ~100-200ms each × ~15 fields = ~2-3s total.
   // We build a local snapshot WITHOUT holding data_mutex_ (USB transfers would
@@ -1101,113 +1188,73 @@ class CyberpowerUpsComponent : public Component {
     tmp = data_;
     xSemaphoreGive(data_mutex_);
 
-    int32_t val;
-    float   fval;
-
-    // ── DEBUG: Log raw vendor reports ──
-    uint8_t dbg_buf[32];
-    for (uint8_t rid = 1; rid <= 45; rid++) {
-      // Probe FEATURE report
-      memset(dbg_buf, 0, sizeof(dbg_buf));
-      if (read_hid_report_(rid, ReportType::FEATURE, dbg_buf, 32)) {
-        bool all_zero = true;
-        for (size_t i = 1; i < 32; i++) {
-          if (dbg_buf[i] != 0) { all_zero = false; break; }
-        }
-        if (!all_zero) {
-          char hex[192] = "";
-          for (size_t i = 0; i < 32; i++) {
-            sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
-          }
-          ESP_LOGI(TAG, "PROBE FEATURE Report %d: %s", rid, hex);
-        }
-      }
-      // Probe INPUT report
-      memset(dbg_buf, 0, sizeof(dbg_buf));
-      if (read_hid_report_(rid, ReportType::INPUT, dbg_buf, 32)) {
-        bool all_zero = true;
-        for (size_t i = 1; i < 32; i++) {
-          if (dbg_buf[i] != 0) { all_zero = false; break; }
-        }
-        if (!all_zero) {
-          char hex[192] = "";
-          for (size_t i = 0; i < 32; i++) {
-            sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
-          }
-          ESP_LOGI(TAG, "PROBE INPUT Report %d: %s", rid, hex);
-        }
-      }
-    }
-
-    // ── Sensor values (no mutex held — transfers can take seconds) ──
-    //
-    // Voltage (0x30) and ConfigVoltage (0x40) each occur once per
-    // collection, so both are looked up with the collection that gives
-    // them their meaning. Without it the first copy in descriptor order
-    // wins, which on a BR1200ELCD is the PowerSummary one — the battery.
-    // That is how mains voltage came to read a rock-steady 252 V: the
-    // raw 252 was a float-charged 24 V pack at 25.2 V.
-
-    auto *f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_INPUT);
-    if (f && read_field_scaled_(f, fval)) tmp.utility_voltage = fval;
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_OUTPUT);
-    if (f && read_field_scaled_(f, fval)) {
-      tmp.output_voltage = fval;
+    if (this->product_id_ == 0x0601) {
+      poll_custom_ups_data_(tmp);
     } else {
-      // No Output collection: on a line-interactive UPS running on mains
-      // the output tracks the input closely enough to stand in for it.
-      tmp.output_voltage = tmp.utility_voltage;
+      int32_t val;
+      float   fval;
+
+      auto *f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_INPUT);
+      if (f && read_field_scaled_(f, fval)) tmp.utility_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_OUTPUT);
+      if (f && read_field_scaled_(f, fval)) {
+        tmp.output_voltage = fval;
+      } else {
+        // No Output collection: on a line-interactive UPS running on mains
+        // the output tracks the input closely enough to stand in for it.
+        tmp.output_voltage = tmp.utility_voltage;
+      }
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_POWER_SUMMARY);
+      if (f && read_field_scaled_(f, fval)) tmp.battery_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_REMAINING_CAPACITY);
+      if (f && read_field_scaled_(f, fval)) tmp.battery_capacity = fval;
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_RUNTIME_TO_EMPTY);
+      if (f && read_field_scaled_(f, fval)) tmp.remaining_runtime_sec = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_PERCENT_LOAD);
+      if (f && read_field_scaled_(f, fval)) tmp.load_percent = fval;
+
+      // Nominal mains voltage lives in the Input collection; the
+      // PowerSummary copy is the nominal *battery* voltage (24 V here).
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_VOLTAGE, PD_COLL_INPUT);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_voltage = fval;
+
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_APPARENT_POWER);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_power_va = fval;
+      // rating_power_va may also come from model name (set during connect)
+
+      // Nameplate active power. Reporting it removes the need to guess a
+      // power factor when converting percent load into watts.
+      f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_ACTIVE_POWER);
+      if (f && read_field_scaled_(f, fval)) tmp.rating_power_w = fval;
+
+      // ── Binary status ──
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_AC_PRESENT);
+      if (f && read_field_value_(f, val)) tmp.ac_present = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_DISCHARGING);
+      if (f && read_field_value_(f, val)) tmp.on_battery = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_CHARGING);
+      if (f && read_field_value_(f, val)) tmp.charging = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_OVERLOAD);
+      if (f && read_field_value_(f, val)) tmp.overload = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_BELOW_REMAINING_CAP);
+      if (f && read_field_value_(f, val)) tmp.battery_low_flag = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_NEED_REPLACEMENT);
+      if (f && read_field_value_(f, val)) tmp.replace_battery = (val != 0);
+
+      f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_SHUTDOWN_IMMINENT);
+      if (f && read_field_value_(f, val)) tmp.shutdown_imminent = (val != 0);
     }
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_VOLTAGE, PD_COLL_POWER_SUMMARY);
-    if (f && read_field_scaled_(f, fval)) tmp.battery_voltage = fval;
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_REMAINING_CAPACITY);
-    if (f && read_field_scaled_(f, fval)) tmp.battery_capacity = fval;
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_RUNTIME_TO_EMPTY);
-    if (f && read_field_scaled_(f, fval)) tmp.remaining_runtime_sec = fval;
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_PERCENT_LOAD);
-    if (f && read_field_scaled_(f, fval)) tmp.load_percent = fval;
-
-    // Nominal mains voltage lives in the Input collection; the
-    // PowerSummary copy is the nominal *battery* voltage (24 V here).
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_VOLTAGE, PD_COLL_INPUT);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_voltage = fval;
-
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_APPARENT_POWER);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_power_va = fval;
-    // rating_power_va may also come from model name (set during connect)
-
-    // Nameplate active power. Reporting it removes the need to guess a
-    // power factor when converting percent load into watts.
-    f = report_map_.find(USAGE_PAGE_POWER_DEVICE, PD_USAGE_CONFIG_ACTIVE_POWER);
-    if (f && read_field_scaled_(f, fval)) tmp.rating_power_w = fval;
-
-    // ── Binary status ──
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_AC_PRESENT);
-    if (f && read_field_value_(f, val)) tmp.ac_present = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_DISCHARGING);
-    if (f && read_field_value_(f, val)) tmp.on_battery = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_CHARGING);
-    if (f && read_field_value_(f, val)) tmp.charging = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_OVERLOAD);
-    if (f && read_field_value_(f, val)) tmp.overload = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_BELOW_REMAINING_CAP);
-    if (f && read_field_value_(f, val)) tmp.battery_low_flag = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_NEED_REPLACEMENT);
-    if (f && read_field_value_(f, val)) tmp.replace_battery = (val != 0);
-
-    f = report_map_.find(USAGE_PAGE_BATTERY, BAT_USAGE_SHUTDOWN_IMMINENT);
-    if (f && read_field_value_(f, val)) tmp.shutdown_imminent = (val != 0);
 
     // ── State Machine (operates on local snapshot) ──
     update_power_state_on_(tmp);
