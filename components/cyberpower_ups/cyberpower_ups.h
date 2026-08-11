@@ -1105,21 +1105,35 @@ class CyberpowerUpsComponent : public Component {
     float   fval;
 
     // ── DEBUG: Log raw vendor reports ──
-    uint8_t dbg_buf[16];
-    for (uint8_t rid : {8, 26, 27, 28, 41}) {
-      size_t xfer_bytes = 16;
-      if (rid == 8) xfer_bytes = 6;
-      else if (rid == 26) xfer_bytes = 2;
-      else if (rid == 27) xfer_bytes = 2;
-      else if (rid == 28) xfer_bytes = 6;
-      else if (rid == 41) xfer_bytes = 3;
-
-      if (read_hid_report_(rid, ReportType::FEATURE, dbg_buf, xfer_bytes)) {
-        char hex[64] = "";
-        for (size_t i = 0; i < xfer_bytes; i++) {
-          sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
+    uint8_t dbg_buf[32];
+    for (uint8_t rid = 1; rid <= 45; rid++) {
+      // Probe FEATURE report
+      if (read_hid_report_(rid, ReportType::FEATURE, dbg_buf, 32)) {
+        bool all_zero = true;
+        for (size_t i = 1; i < 32; i++) {
+          if (dbg_buf[i] != 0) { all_zero = false; break; }
         }
-        ESP_LOGI(TAG, "DEBUG: Raw Feature Report %d: %s", rid, hex);
+        if (!all_zero) {
+          char hex[128] = "";
+          for (size_t i = 0; i < 16; i++) {
+            sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
+          }
+          ESP_LOGI(TAG, "PROBE FEATURE Report %d: %s", rid, hex);
+        }
+      }
+      // Probe INPUT report
+      if (read_hid_report_(rid, ReportType::INPUT, dbg_buf, 32)) {
+        bool all_zero = true;
+        for (size_t i = 1; i < 32; i++) {
+          if (dbg_buf[i] != 0) { all_zero = false; break; }
+        }
+        if (!all_zero) {
+          char hex[128] = "";
+          for (size_t i = 0; i < 16; i++) {
+            sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
+          }
+          ESP_LOGI(TAG, "PROBE INPUT Report %d: %s", rid, hex);
+        }
       }
     }
 
