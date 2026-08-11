@@ -1108,28 +1108,30 @@ class CyberpowerUpsComponent : public Component {
     uint8_t dbg_buf[32];
     for (uint8_t rid = 1; rid <= 45; rid++) {
       // Probe FEATURE report
+      memset(dbg_buf, 0, sizeof(dbg_buf));
       if (read_hid_report_(rid, ReportType::FEATURE, dbg_buf, 32)) {
         bool all_zero = true;
         for (size_t i = 1; i < 32; i++) {
           if (dbg_buf[i] != 0) { all_zero = false; break; }
         }
         if (!all_zero) {
-          char hex[128] = "";
-          for (size_t i = 0; i < 16; i++) {
+          char hex[192] = "";
+          for (size_t i = 0; i < 32; i++) {
             sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
           }
           ESP_LOGI(TAG, "PROBE FEATURE Report %d: %s", rid, hex);
         }
       }
       // Probe INPUT report
+      memset(dbg_buf, 0, sizeof(dbg_buf));
       if (read_hid_report_(rid, ReportType::INPUT, dbg_buf, 32)) {
         bool all_zero = true;
         for (size_t i = 1; i < 32; i++) {
           if (dbg_buf[i] != 0) { all_zero = false; break; }
         }
         if (!all_zero) {
-          char hex[128] = "";
-          for (size_t i = 0; i < 16; i++) {
+          char hex[192] = "";
+          for (size_t i = 0; i < 32; i++) {
             sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
           }
           ESP_LOGI(TAG, "PROBE INPUT Report %d: %s", rid, hex);
