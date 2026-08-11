@@ -1104,6 +1104,25 @@ class CyberpowerUpsComponent : public Component {
     int32_t val;
     float   fval;
 
+    // ── DEBUG: Log raw vendor reports ──
+    uint8_t dbg_buf[16];
+    for (uint8_t rid : {8, 26, 27, 28, 41}) {
+      size_t xfer_bytes = 16;
+      if (rid == 8) xfer_bytes = 6;
+      else if (rid == 26) xfer_bytes = 2;
+      else if (rid == 27) xfer_bytes = 2;
+      else if (rid == 28) xfer_bytes = 6;
+      else if (rid == 41) xfer_bytes = 3;
+
+      if (read_hid_report_(rid, ReportType::FEATURE, dbg_buf, xfer_bytes)) {
+        char hex[64] = "";
+        for (size_t i = 0; i < xfer_bytes; i++) {
+          sprintf(hex + strlen(hex), "%02X ", dbg_buf[i]);
+        }
+        ESP_LOGI(TAG, "DEBUG: Raw Feature Report %d: %s", rid, hex);
+      }
+    }
+
     // ── Sensor values (no mutex held — transfers can take seconds) ──
     //
     // Voltage (0x30) and ConfigVoltage (0x40) each occur once per
